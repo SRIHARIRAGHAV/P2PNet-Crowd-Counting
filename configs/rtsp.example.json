@@ -1,0 +1,15 @@
+{
+  "mode": "rtsp",
+  "source_env": "P2PNET_RTSP_URL",
+  "checkpoint": "original_repo/weights/SHTechA.pth",
+  "device": "auto",
+  "threshold": 0.5,
+  "max_long_edge": 1024,
+  "threads": 1,
+  "frame_skip": 1,
+  "duration": 0,
+  "record": false,
+  "no_display": false,
+  "display_width": 1280,
+  "display_height": 720
+}

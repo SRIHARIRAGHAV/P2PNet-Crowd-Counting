@@ -1,0 +1,46 @@
+# Python bytecode and test/build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Local Python environments, including nested upstream environments
+.venv*/
+**/.venv*/
+
+# IDE and machine-local settings
+.vscode/
+.idea/
+
+# Credentials and local environment files
+.env
+.env.*
+!.env.example
+
+# Model checkpoints and downloaded weights
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+pretrained_weights/
+
+# Generated inference, evaluation, and training artifacts
+outputs/
+runs/
+logs/
+
+# Large/private source datasets; keep manifests and license documentation
+dataset/_incoming/
+dataset/frames/
+dataset/video/
+dataset/crowd_counting/images/
+dataset/crowd_counting/annotations/points/
+dataset/crowd_counting/annotations/all_points.txt
+dataset/crowd_counting/annotations/counts.csv
+dataset/JHU-CROWD++/train/
+dataset/JHU-CROWD++/val/
+dataset/JHU-CROWD++/test/

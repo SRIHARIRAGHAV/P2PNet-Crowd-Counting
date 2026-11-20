@@ -1,0 +1,4 @@
+# Install matching CUDA-enabled torch and torchvision first using the official
+# PyTorch selector. This file intentionally contains no torch packages and will
+# not replace an installed CUDA build.
+-r requirements.txt

@@ -1,0 +1,9 @@
+{
+  "mode": "video",
+  "input": "dataset/video/park_video.mp4",
+  "checkpoint": "original_repo/weights/SHTechA.pth",
+  "device": "auto",
+  "threshold": 0.5,
+  "max_long_edge": 1024,
+  "threads": 1
+}
