@@ -22,7 +22,6 @@ dist/
 !.env.example
 
 # Model checkpoints and downloaded weights
-*.pth
 *.pt
 *.ckpt
 *.safetensors
