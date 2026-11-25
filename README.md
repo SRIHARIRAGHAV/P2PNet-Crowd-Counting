@@ -56,16 +56,13 @@ provided park video and image examples are not included in a clone.
 
 ## Tested environment and requirements
 
-The recorded local verification environment was Python **3.13.17**,
-PyTorch **2.14.1+cpu**, torchvision **0.29.1+cpu**, NumPy **2.5.4**, and
-OpenCV **5.0.0**. CPU checkpoint loading and inference were verified on that
-environment. CUDA inference, full training, and access to a physical RTSP
-camera were not verified here. The RTSP reader, parsing, frame handling,
-display transforms, and reconnect behavior have automated simulated tests.
-
-Python 3.13 is the tested runtime, not a guarantee that every upstream training
-dependency supports every Python version. Dependencies are split so that GPU
-setup does not silently replace a CUDA-enabled PyTorch build:
+The dependency pins include Python 3.10-compatible Linux wheels, so Ubuntu
+Python 3.10.x can install and run CPU inference. The current pins also support
+Python 3.13. Python 3.10 on Ubuntu has not been executed in this workspace;
+validate checkpoint loading and inference on the target machine before
+deployment. CUDA inference, full training, and access to a physical RTSP
+camera are not claimed as verified. Dependencies are split so that GPU setup
+does not silently replace a CUDA-enabled PyTorch build:
 
 - `requirements.txt`: shared NumPy, SciPy, Matplotlib, Pillow, OpenCV, and
   TensorBoardX dependencies.
@@ -87,6 +84,9 @@ From the project directory in PowerShell:
 The last command should report a CPU PyTorch build and `False` for CUDA.
 
 ### CPU setup on Linux
+
+Install Python 3.10 and its `venv` package first (for example,
+`python3.10-venv` on Ubuntu), then run:
 
 ```bash
 bash scripts/setup_cpu_linux.sh

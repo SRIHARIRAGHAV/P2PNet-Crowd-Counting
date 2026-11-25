@@ -1,8 +1,8 @@
 # Common dependencies for image/video/RTSP inference, evaluation, and training.
 # Install a CPU or CUDA PyTorch build separately using the matching requirements file.
-numpy==2.5.4
-scipy==1.18.1
-matplotlib==3.11.2
-Pillow==13.0.0
-opencv-python==5.0.0.93
+numpy==2.2.6
+scipy==1.15.3
+matplotlib==3.10.8
+Pillow==12.1.1
+opencv-python==4.12.0.88
 tensorboardX==2.6.5
