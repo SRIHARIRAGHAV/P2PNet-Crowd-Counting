@@ -26,6 +26,11 @@ sys.path.insert(0, str(REPOSITORY))
 
 from inference.device import resolve_device
 from inference.run_frames import image_tensor
+from inference.performance import (
+    ProcessResourceMonitor,
+    RollingPerformance,
+    RunningStats,
+)
 from models import build_model
 
 
@@ -82,7 +87,17 @@ def parse_args(argv=None):
     )
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--max-long-edge", type=int, default=1024)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="PyTorch CPU intra-op threads; 0 preserves PyTorch's default.",
+    )
+    parser.add_argument(
+        "--channels-last",
+        action="store_true",
+        help="Use channels-last tensors on CPU; benchmark before enabling.",
+    )
     parser.add_argument("--frame-skip", type=int, default=1)
     parser.add_argument("--low-max-count", type=int, default=20)
     parser.add_argument("--moderate-max-count", type=int, default=50)
@@ -129,7 +144,12 @@ def parse_args(argv=None):
             "Do not store an RTSP URL in a config file; use --source-env instead."
         )
 
-    boolean_options = {"record", "no_display", "overwrite"}
+    boolean_options = {
+        "record",
+        "no_display",
+        "overwrite",
+        "channels_last",
+    }
     defaults = {}
     for key, value in config_values.items():
         action = actions[key]
@@ -207,7 +227,11 @@ def valid_prediction_points(outputs, threshold, original_size, resized_size):
 
 
 def device_summary(device):
-    summary = {"inference_device": str(device)}
+    summary = {
+        "inference_device": str(device),
+        "cpu_intra_op_threads": torch.get_num_threads(),
+        "cpu_inter_op_threads": torch.get_num_interop_threads(),
+    }
     if device.type == "cuda":
         properties = torch.cuda.get_device_properties(device)
         summary.update({
@@ -233,6 +257,11 @@ def device_summary(device):
 def print_device_summary(device):
     summary = device_summary(device)
     print(f"Selected inference device: {summary['inference_device']}")
+    print(
+        "PyTorch CPU threads: "
+        f"intra-op={summary['cpu_intra_op_threads']}, "
+        f"inter-op={summary['cpu_inter_op_threads']}"
+    )
     if device.type == "cuda":
         print(
             f"GPU: {summary['gpu_name']}; memory allocated/reserved/total: "
@@ -244,7 +273,25 @@ def print_device_summary(device):
         print("GPU: unavailable (CPU inference); GPU memory: unavailable")
 
 
+def print_runtime_summary(checkpoint_path, device):
+    cuda_runtime = torch.version.cuda if torch.cuda.is_available() else None
+    print(f"Python version: {sys.version.split()[0]}")
+    print(f"PyTorch version: {torch.__version__}")
+    print(f"CUDA availability: {torch.cuda.is_available()}")
+    print(f"PyTorch CUDA runtime: {cuda_runtime or 'not available'}")
+    if device.type == "cuda":
+        print(
+            "GPU device: "
+            f"{torch.cuda.get_device_name(device)}"
+        )
+    else:
+        print("GPU device: unavailable")
+    print(f"Selected inference device: {device}")
+    print(f"Checkpoint path: {checkpoint_path}")
+
+
 def prepare_and_infer(frame, model, threshold, max_long_edge):
+    preprocessing_started = time.perf_counter()
     original_rgb = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     original_width, original_height = original_rgb.size
     scale = min(1.0, float(max_long_edge) / max(original_rgb.size))
@@ -262,6 +309,11 @@ def prepare_and_infer(frame, model, threshold, max_long_edge):
 
     device = next(model.parameters()).device
     samples = image_tensor(prepared).unsqueeze(0).to(device)
+    if samples.device.type == "cpu" and next(model.parameters()).is_contiguous(
+        memory_format=torch.channels_last
+    ):
+        samples = samples.contiguous(memory_format=torch.channels_last)
+    preprocessing_ms = (time.perf_counter() - preprocessing_started) * 1000.0
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     inference_started = time.perf_counter()
@@ -270,13 +322,15 @@ def prepare_and_infer(frame, model, threshold, max_long_edge):
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     inference_ms = (time.perf_counter() - inference_started) * 1000.0
+    postprocessing_started = time.perf_counter()
     points = valid_prediction_points(
         outputs,
         threshold,
         (original_width, original_height),
         (resized_width, resized_height),
     )
-    return points, inference_ms
+    postprocessing_ms = (time.perf_counter() - postprocessing_started) * 1000.0
+    return points, inference_ms, preprocessing_ms, postprocessing_ms
 
 
 def available_display_bounds():
@@ -618,17 +672,12 @@ def draw_live_overlay(
     inference_ms,
     processing_fps,
     crowd_status,
+    performance=None,
 ):
     height, width = frame.shape[:2]
     scale = max(0.35, min(0.65, width / 1000.0 * 0.58))
     line_height = max(22, int(29 * scale / 0.58))
     panel_width = min(width, max(360, int(width * 0.55)))
-    panel_height = min(height, line_height * 8 + 16)
-    panel = frame[:panel_height, :panel_width]
-    shade = panel.copy()
-    cv2.rectangle(shade, (0, 0), (panel_width, panel_height), (20, 20, 20), -1)
-    cv2.addWeighted(shade, 0.72, panel, 0.28, 0, panel)
-
     status_color = (
         (90, 230, 90)
         if camera_status == "CONNECTED"
@@ -636,16 +685,54 @@ def draw_live_overlay(
         if camera_status in {"CONNECTING", "RECONNECTING"}
         else (80, 80, 255)
     )
+    performance = performance or {}
     lines = [
         ("SAFE LENS AI - LIVE CROWD MONITORING", (255, 255, 255), 1),
         (f"CROWD COUNT: {len(points)}", (0, 230, 255), 2),
         (f"CAMERA STATUS: {camera_status}", status_color, 1),
         (f"FRAME NUMBER: {frame_number}", (255, 255, 255), 1),
         (f"STREAM TIMESTAMP: {timestamp}", (255, 255, 255), 1),
-        (f"INFERENCE TIME: {inference_ms:.1f} ms", (255, 255, 255), 1),
-        (f"PROCESSING FPS: {processing_fps:.2f}", (255, 255, 255), 1),
+        (
+            f"INFERENCE: {inference_ms:.1f} ms "
+            f"(avg {performance.get('inference_ms', inference_ms):.1f} ms)",
+            (255, 255, 255),
+            1,
+        ),
+        (
+            f"PRE/POST: {performance.get('preprocessing_ms', 0.0):.1f}/"
+            f"{performance.get('postprocessing_ms', 0.0):.1f} ms",
+            (255, 255, 255),
+            1,
+        ),
+        (
+            f"INFERENCE FPS: {performance.get('inference_fps', 0.0):.2f}",
+            (255, 255, 255),
+            1,
+        ),
+        (
+            f"PROCESSING FPS: {performance.get('processing_fps', processing_fps):.2f}",
+            (255, 255, 255),
+            1,
+        ),
+        (
+            f"CPU: {performance.get('cpu_percent', 0.0):.0f}%  "
+            f"RAM: {performance.get('memory_mb', 0.0):.0f} MiB",
+            (255, 255, 255),
+            1,
+        ),
+        (
+            f"PROCESSED FRAMES: {performance.get('processed_frames', 0)}",
+            (255, 255, 255),
+            1,
+        ),
         (f"CROWD STATUS: {crowd_status} (DEMO ONLY)", (120, 255, 120), 1),
     ]
+    panel_height = min(height, line_height * len(lines) + 16)
+    panel = frame[:panel_height, :panel_width]
+    shade = panel.copy()
+    cv2.rectangle(shade, (0, 0), (panel_width, panel_height), (20, 20, 20), -1)
+    cv2.addWeighted(shade, 0.72, panel, 0.28, 0, panel)
+
     margin_x = max(8, int(14 * scale / 0.58))
     y = max(18, int(23 * scale / 0.58))
     for text, color, thickness in lines:
@@ -705,6 +792,7 @@ def load_model(checkpoint_path, device):
         ) from error
     model.to(device)
     model.eval()
+    print(f"Checkpoint loading status: loaded successfully with strict=True")
     return model
 
 
@@ -819,9 +907,19 @@ def run_rtsp(args, model, source, capture_factory=None):
     writer = None
     recording_started = False
     recording_size = None
-    frame_counts = []
-    inference_times = []
-    processing_times = []
+    count_stats = RunningStats()
+    inference_stats = RunningStats()
+    preprocessing_stats = RunningStats()
+    postprocessing_stats = RunningStats()
+    processing_stats = RunningStats()
+    cpu_stats = RunningStats()
+    rolling_performance = RollingPerformance()
+    resource_monitor = ProcessResourceMonitor()
+    latest_resources = {
+        "cpu_percent": 0.0,
+        "memory_mb": 0.0,
+        "peak_memory_mb": 0.0,
+    }
     processed_frames = 0
     last_sequence = 0
     last_frame = None
@@ -829,7 +927,10 @@ def run_rtsp(args, model, source, capture_factory=None):
     last_points = np.empty((0, 2), dtype=np.float32)
     last_timestamp = "--"
     last_inference_ms = 0.0
+    last_preprocessing_ms = 0.0
+    last_postprocessing_ms = 0.0
     last_processing_fps = 0.0
+    last_performance = rolling_performance.snapshot()
     last_camera_status = "CONNECTING"
     display_size = None
     display_window_created = False
@@ -847,9 +948,14 @@ def run_rtsp(args, model, source, capture_factory=None):
                     "stream_timestamp",
                     "estimated_crowd_count",
                     "predicted_head_point_count",
+                    "preprocessing_time_ms",
                     "inference_time_ms",
+                    "postprocessing_time_ms",
                     "total_processing_time_ms",
+                    "inference_fps",
                     "processing_fps",
+                    "cpu_percent",
+                    "memory_mb",
                     "camera_connection_status",
                 ],
             )
@@ -880,7 +986,12 @@ def run_rtsp(args, model, source, capture_factory=None):
                     )
                     if selected:
                         processing_started = time.perf_counter()
-                        last_points, last_inference_ms = prepare_and_infer(
+                        (
+                            last_points,
+                            last_inference_ms,
+                            last_preprocessing_ms,
+                            last_postprocessing_ms,
+                        ) = prepare_and_infer(
                             frame,
                             model,
                             args.threshold,
@@ -927,16 +1038,6 @@ def run_rtsp(args, model, source, capture_factory=None):
                                     "stopping to avoid a corrupt output video."
                                 )
 
-                        processing_preview = max(
-                            time.perf_counter() - processing_started,
-                            1e-9,
-                        )
-                        processing_fps_preview = (
-                            processed_frames + 1
-                        ) / (
-                            sum(processing_times) / 1000.0
-                            + processing_preview
-                        )
                         last_frame = frame.copy()
                         draw_live_overlay(
                             frame,
@@ -945,8 +1046,13 @@ def run_rtsp(args, model, source, capture_factory=None):
                             frame_number,
                             last_timestamp,
                             last_inference_ms,
-                            processing_fps_preview,
+                            last_processing_fps,
                             crowd_status,
+                            {
+                                **last_performance,
+                                **latest_resources,
+                                "processed_frames": processed_frames,
+                            },
                         )
                         if writer is not None:
                             writer.write(frame)
@@ -956,28 +1062,51 @@ def run_rtsp(args, model, source, capture_factory=None):
                             1e-9,
                         )
                         processing_ms = processing_seconds * 1000.0
-                        frame_counts.append(len(last_points))
-                        inference_times.append(last_inference_ms)
-                        processing_times.append(processing_ms)
+                        count_stats.add(len(last_points))
+                        inference_stats.add(last_inference_ms)
+                        preprocessing_stats.add(last_preprocessing_ms)
+                        postprocessing_stats.add(last_postprocessing_ms)
+                        processing_stats.add(processing_ms)
                         processed_frames += 1
-                        last_processing_fps = (
-                            processed_frames / sum(processing_times) * 1000.0
+                        rolling_performance.add(
+                            last_preprocessing_ms,
+                            last_inference_ms,
+                            last_postprocessing_ms,
+                            processing_ms,
                         )
+                        last_performance = rolling_performance.snapshot()
+                        latest_resources = resource_monitor.sample()
+                        cpu_stats.add(latest_resources["cpu_percent"])
+                        last_processing_fps = last_performance["processing_fps"]
 
                         csv_writer.writerow({
                             "frame_number": frame_number,
                             "stream_timestamp": last_timestamp,
                             "estimated_crowd_count": len(last_points),
                             "predicted_head_point_count": len(last_points),
+                            "preprocessing_time_ms": (
+                                f"{last_preprocessing_ms:.3f}"
+                            ),
                             "inference_time_ms": f"{last_inference_ms:.3f}",
+                            "postprocessing_time_ms": (
+                                f"{last_postprocessing_ms:.3f}"
+                            ),
                             "total_processing_time_ms": f"{processing_ms:.3f}",
+                            "inference_fps": (
+                                f"{last_performance['inference_fps']:.3f}"
+                            ),
                             "processing_fps": f"{last_processing_fps:.3f}",
+                            "cpu_percent": f"{latest_resources['cpu_percent']:.1f}",
+                            "memory_mb": f"{latest_resources['memory_mb']:.1f}",
                             "camera_connection_status": camera_status,
                         })
                         print(
                             f"Frame {frame_number}: {len(last_points)} people, "
-                            f"inference {last_inference_ms:.1f} ms, "
-                            f"processing FPS {last_processing_fps:.2f}"
+                            f"inference {last_performance['inference_ms']:.1f} ms "
+                            f"({last_performance['inference_fps']:.2f} FPS), "
+                            f"processing {last_processing_fps:.2f} FPS, "
+                            f"CPU {latest_resources['cpu_percent']:.0f}%, "
+                            f"RAM {latest_resources['memory_mb']:.0f} MiB"
                         )
 
                     if not args.no_display and last_frame is not None:
@@ -1030,6 +1159,11 @@ def run_rtsp(args, model, source, capture_factory=None):
                                 args.low_max_count,
                                 args.moderate_max_count,
                             ),
+                            {
+                                **last_performance,
+                                **latest_resources,
+                                "processed_frames": processed_frames,
+                            },
                         )
                         cv2.imshow(LIVE_WINDOW_NAME, display_frame)
                         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -1055,7 +1189,6 @@ def run_rtsp(args, model, source, capture_factory=None):
             cv2.destroyAllWindows()
 
         monitoring_duration = time.monotonic() - started
-        processing_total_seconds = sum(processing_times) / 1000.0
         summary = {
             "source_type": "RTSP",
             "checkpoint": str(args.checkpoint.resolve()),
@@ -1064,22 +1197,33 @@ def run_rtsp(args, model, source, capture_factory=None):
             "output_video": str(output_path) if output_path is not None else None,
             "csv_results": str(csv_path),
             "total_processed_frames": processed_frames,
-            "average_crowd_count": (
-                float(np.mean(frame_counts)) if frame_counts else None
-            ),
-            "maximum_crowd_count": max(frame_counts) if frame_counts else None,
-            "minimum_crowd_count": min(frame_counts) if frame_counts else None,
-            "average_inference_time_ms": (
-                float(np.mean(inference_times)) if inference_times else None
-            ),
-            "average_total_processing_time_ms": (
-                float(np.mean(processing_times)) if processing_times else None
-            ),
+            "average_crowd_count": count_stats.mean if count_stats.count else None,
+            "maximum_crowd_count": count_stats.maximum,
+            "minimum_crowd_count": count_stats.minimum,
+            "average_inference_time_ms": inference_stats.mean,
+            "average_preprocessing_time_ms": preprocessing_stats.mean,
+            "average_postprocessing_time_ms": postprocessing_stats.mean,
+            "average_total_processing_time_ms": processing_stats.mean,
             "average_processing_fps": (
-                processed_frames / processing_total_seconds
-                if processing_total_seconds > 0
+                processed_frames * 1000.0 / processing_stats.total
+                if processing_stats.total > 0
                 else 0.0
             ),
+            "average_processed_frame_fps_over_monitoring": (
+                processed_frames / monitoring_duration
+                if monitoring_duration > 0
+                else 0.0
+            ),
+            "average_inference_fps": (
+                processed_frames * 1000.0 / inference_stats.total
+                if inference_stats.total > 0
+                else 0.0
+            ),
+            "rolling_window_frames": 30,
+            "final_rolling_performance": last_performance,
+            "average_cpu_percent": cpu_stats.mean,
+            "memory_mb": latest_resources["memory_mb"],
+            "peak_memory_mb": latest_resources["peak_memory_mb"],
             "total_stream_monitoring_duration_seconds": monitoring_duration,
             "reconnection_attempts": reader.reconnection_attempts,
             "final_camera_status": last_camera_status,
@@ -1139,8 +1283,8 @@ def main():
         raise ValueError("--threshold must be between 0 and 1.")
     if args.max_long_edge < 128:
         raise ValueError("--max-long-edge must be at least 128.")
-    if args.threads < 1:
-        raise ValueError("--threads must be at least 1.")
+    if args.threads < 0:
+        raise ValueError("--threads cannot be negative.")
     if args.low_max_count < 0 or args.moderate_max_count <= args.low_max_count:
         raise ValueError(
             "Crowd status thresholds must satisfy "
@@ -1196,19 +1340,17 @@ def main():
             raise RuntimeError(
                 "RTSP mode requires OpenCV built with the FFmpeg video backend."
             )
-        torch.set_num_threads(args.threads)
+        if args.threads:
+            torch.set_num_threads(args.threads)
         torch.set_num_interop_threads(1)
         model = load_model(checkpoint_path, device)
+        if args.channels_last:
+            if device.type != "cpu":
+                raise ValueError("--channels-last is only supported for CPU inference.")
+            model.to(memory_format=torch.channels_last)
+        print_runtime_summary(checkpoint_path, device)
         print_device_summary(device)
-        prior_cv_log_level = None
-        if hasattr(cv2, "setLogLevel") and hasattr(cv2, "LOG_LEVEL_SILENT"):
-            prior_cv_log_level = cv2.getLogLevel()
-            cv2.setLogLevel(cv2.LOG_LEVEL_SILENT)
-        try:
-            run_rtsp(args, model, source)
-        finally:
-            if prior_cv_log_level is not None:
-                cv2.setLogLevel(prior_cv_log_level)
+        run_rtsp(args, model, source)
         return
 
     if args.source:
@@ -1217,8 +1359,6 @@ def main():
         raise ValueError("--record is only used with --mode rtsp.")
     if args.duration > 0:
         raise ValueError("--duration is only used with --mode rtsp.")
-    if args.frame_skip != 1:
-        raise ValueError("--frame-skip is only used with --mode rtsp.")
     if args.output is None:
         args.output = Path("outputs/park_video/park_crowd_count_output.mp4")
     if args.output.suffix.lower() != ".mp4":
@@ -1253,9 +1393,15 @@ def main():
         f"{summary_path.stem}.{temporary_tag}{summary_path.suffix}"
     )
 
-    torch.set_num_threads(args.threads)
+    if args.threads:
+        torch.set_num_threads(args.threads)
     torch.set_num_interop_threads(1)
     model = load_model(checkpoint_path, device)
+    if args.channels_last:
+        if device.type != "cpu":
+            raise ValueError("--channels-last is only supported for CPU inference.")
+        model.to(memory_format=torch.channels_last)
+    print_runtime_summary(checkpoint_path, device)
     print_device_summary(device)
 
     capture = cv2.VideoCapture(str(input_path))
@@ -1295,10 +1441,22 @@ def main():
             "Try a different output directory or codec-capable OpenCV build."
         )
 
-    frame_counts = []
-    inference_times = []
-    processing_times = []
+    count_stats = RunningStats()
+    inference_stats = RunningStats()
+    preprocessing_stats = RunningStats()
+    postprocessing_stats = RunningStats()
+    processing_stats = RunningStats()
+    cpu_stats = RunningStats()
+    rolling_performance = RollingPerformance()
+    resource_monitor = ProcessResourceMonitor()
+    latest_resources = {
+        "cpu_percent": 0.0,
+        "memory_mb": 0.0,
+        "peak_memory_mb": 0.0,
+    }
     processed_frames = 0
+    decoded_frames = 0
+    video_started = time.perf_counter()
     completed = False
     try:
         with temporary_csv.open("w", newline="", encoding="utf-8") as csv_file:
@@ -1309,8 +1467,14 @@ def main():
                     "timestamp",
                     "estimated_crowd_count",
                     "predicted_head_point_count",
+                    "preprocessing_time_ms",
                     "inference_time_ms",
+                    "postprocessing_time_ms",
                     "processing_time_ms",
+                    "inference_fps",
+                    "processing_fps",
+                    "cpu_percent",
+                    "memory_mb",
                 ],
             )
             csv_writer.writeheader()
@@ -1326,10 +1490,20 @@ def main():
                             "a fixed-resolution MP4 cannot preserve those frames."
                         )
 
-                    frame_index = processed_frames
+                    frame_index = decoded_frames
                     frame_number = frame_index + 1
+                    decoded_frames += 1
+                    if frame_index % args.frame_skip:
+                        writer.write(frame)
+                        continue
+
                     timestamp = timestamp_for_frame(frame_index, source_fps)
-                    points, inference_ms = prepare_and_infer(
+                    (
+                        points,
+                        inference_ms,
+                        preprocessing_ms,
+                        postprocessing_ms,
+                    ) = prepare_and_infer(
                         frame,
                         model,
                         args.threshold,
@@ -1351,23 +1525,49 @@ def main():
                     writer.write(frame)
 
                     processing_ms = (time.perf_counter() - frame_started) * 1000.0
-                    frame_counts.append(count)
-                    inference_times.append(inference_ms)
-                    processing_times.append(processing_ms)
+                    count_stats.add(count)
+                    inference_stats.add(inference_ms)
+                    preprocessing_stats.add(preprocessing_ms)
+                    postprocessing_stats.add(postprocessing_ms)
+                    processing_stats.add(processing_ms)
                     processed_frames += 1
+                    rolling_performance.add(
+                        preprocessing_ms,
+                        inference_ms,
+                        postprocessing_ms,
+                        processing_ms,
+                    )
+                    rolling_metrics = rolling_performance.snapshot()
+                    latest_resources = resource_monitor.sample()
+                    cpu_stats.add(latest_resources["cpu_percent"])
                     csv_writer.writerow({
                         "frame_number": frame_number,
                         "timestamp": timestamp,
                         "estimated_crowd_count": count,
                         "predicted_head_point_count": len(points),
+                        "preprocessing_time_ms": f"{preprocessing_ms:.3f}",
                         "inference_time_ms": f"{inference_ms:.3f}",
+                        "postprocessing_time_ms": f"{postprocessing_ms:.3f}",
                         "processing_time_ms": f"{processing_ms:.3f}",
+                        "inference_fps": (
+                            f"{rolling_metrics['inference_fps']:.3f}"
+                        ),
+                        "processing_fps": (
+                            f"{rolling_metrics['processing_fps']:.3f}"
+                        ),
+                        "cpu_percent": f"{latest_resources['cpu_percent']:.1f}",
+                        "memory_mb": f"{latest_resources['memory_mb']:.1f}",
                     })
                     if frame_number == 1 or frame_number % 30 == 0:
                         print(
                             f"Frame {frame_number}: {count} people, "
-                            f"inference {inference_ms:.1f} ms, "
-                            f"processing {processing_ms:.1f} ms"
+                            f"inference {rolling_metrics['inference_ms']:.1f} ms "
+                            f"({rolling_metrics['inference_fps']:.2f} FPS), "
+                            f"pre/post {preprocessing_ms:.1f}/"
+                            f"{postprocessing_ms:.1f} ms, "
+                            f"processing {rolling_metrics['processing_fps']:.2f} FPS, "
+                            f"CPU {latest_resources['cpu_percent']:.0f}%, "
+                            f"RAM {latest_resources['memory_mb']:.0f} MiB"
                         )
 
         writer.release()
@@ -1377,15 +1577,15 @@ def main():
         if (
             not args.max_frames
             and source_frames > 0
-            and processed_frames != source_frames
+            and decoded_frames != source_frames
         ):
             raise RuntimeError(
-                f"Decoded {processed_frames} frames, but the video reports "
+                f"Decoded {decoded_frames} frames, but the video reports "
                 f"{source_frames}; refusing to publish an incomplete output."
             )
 
-        total_processing_seconds = sum(processing_times) / 1000.0
-        processed_duration = processed_frames / source_fps
+        video_processing_seconds = max(time.perf_counter() - video_started, 1e-9)
+        processed_duration = decoded_frames / source_fps
         source_duration = (
             source_frames / source_fps if source_frames > 0 else processed_duration
         )
@@ -1396,19 +1596,36 @@ def main():
             "output_video": str(output_path),
             "csv_results": str(csv_path),
             "total_processed_frames": processed_frames,
+            "total_decoded_frames": decoded_frames,
             "source_frame_count": source_frames if source_frames > 0 else None,
-            "average_estimated_crowd_count": float(np.mean(frame_counts)),
-            "maximum_estimated_crowd_count": int(max(frame_counts)),
-            "minimum_estimated_crowd_count": int(min(frame_counts)),
-            "average_inference_time_ms_per_frame": float(np.mean(inference_times)),
-            "average_total_processing_time_ms_per_frame": float(
-                np.mean(processing_times)
-            ),
+            "average_estimated_crowd_count": count_stats.mean,
+            "maximum_estimated_crowd_count": int(count_stats.maximum),
+            "minimum_estimated_crowd_count": int(count_stats.minimum),
+            "average_preprocessing_time_ms_per_frame": preprocessing_stats.mean,
+            "average_inference_time_ms_per_frame": inference_stats.mean,
+            "average_postprocessing_time_ms_per_frame": postprocessing_stats.mean,
+            "average_total_processing_time_ms_per_frame": processing_stats.mean,
             "average_processing_fps": (
-                processed_frames / total_processing_seconds
-                if total_processing_seconds > 0
+                processed_frames / video_processing_seconds
+                if video_processing_seconds > 0
                 else 0.0
             ),
+            "average_decoded_frame_fps": (
+                decoded_frames / video_processing_seconds
+                if video_processing_seconds > 0
+                else 0.0
+            ),
+            "video_processing_wall_time_seconds": video_processing_seconds,
+            "average_inference_fps": (
+                processed_frames * 1000.0 / inference_stats.total
+                if inference_stats.total > 0
+                else 0.0
+            ),
+            "rolling_window_frames": 30,
+            "final_rolling_performance": rolling_performance.snapshot(),
+            "average_cpu_percent": cpu_stats.mean,
+            "memory_mb": latest_resources["memory_mb"],
+            "peak_memory_mb": latest_resources["peak_memory_mb"],
             "video_duration_seconds": source_duration,
             "processed_output_duration_seconds": processed_duration,
             "source_fps": source_fps,
@@ -1416,6 +1633,8 @@ def main():
             "frame_width": width,
             "frame_height": height,
             "confidence_threshold": args.threshold,
+            "frame_skip": args.frame_skip,
+            "channels_last": args.channels_last,
             "crowd_status_thresholds": {
                 "low": f"0-{args.low_max_count}",
                 "moderate": f"{args.low_max_count + 1}-{args.moderate_max_count}",

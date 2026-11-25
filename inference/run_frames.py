@@ -22,14 +22,15 @@ from models import build_model
 
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff"}
+IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGE_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
 def image_tensor(image):
-    array = np.asarray(image, dtype=np.float32).copy().transpose((2, 0, 1))
+    array = np.asarray(image, dtype=np.float32).transpose((2, 0, 1))
     tensor = torch.from_numpy(array).div_(255.0)
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-    return (tensor - mean) / std
+    tensor.sub_(IMAGE_MEAN).div_(IMAGE_STD)
+    return tensor.contiguous()
 
 
 def parse_args():
@@ -52,7 +53,12 @@ def parse_args():
     )
     parser.add_argument("--max-long-edge", type=int, default=1024)
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--threads", type=int, default=1)
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=0,
+        help="PyTorch CPU intra-op threads; 0 preserves PyTorch's default.",
+    )
     parser.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda", "cuda:0"),
@@ -80,10 +86,12 @@ def main():
     if not image_paths:
         raise FileNotFoundError("No supported image frames found in {}".format(args.frames_dir))
 
-    if args.threads < 1:
-        raise ValueError("--threads must be at least 1.")
+    if args.threads < 0:
+        raise ValueError("--threads cannot be negative.")
 
-    torch.set_num_threads(args.threads)
+    if args.threads:
+        torch.set_num_threads(args.threads)
+    torch.set_num_interop_threads(1)
     device = resolve_device(args.device)
     print("Selected inference device: {}".format(device))
     model = build_model(SimpleNamespace(backbone="vgg16_bn", row=2, line=2), training=False)

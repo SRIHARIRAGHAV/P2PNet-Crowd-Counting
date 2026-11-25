@@ -10,6 +10,7 @@ from unittest import mock
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 
 
 MODEL_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +29,8 @@ from predict_video import (
     rtsp_output_paths,
     valid_prediction_points,
 )
+from inference.performance import ProcessResourceMonitor, RollingPerformance
+from inference.run_frames import image_tensor
 from models.p2pnet import AnchorPoints
 
 
@@ -59,6 +62,58 @@ class FakeCapture:
 
 
 class RtspSupportTests(unittest.TestCase):
+    def test_preprocessing_matches_existing_normalization(self):
+        pixels = np.arange(128 * 128 * 3, dtype=np.uint32)
+        pixels = (pixels % 256).astype(np.uint8).reshape((128, 128, 3))
+        image = Image.fromarray(pixels)
+
+        old_array = np.asarray(image, dtype=np.float32).copy().transpose((2, 0, 1))
+        old_tensor = torch.from_numpy(old_array).div_(255.0)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        expected = (old_tensor - mean) / std
+
+        actual = image_tensor(image)
+
+        self.assertTrue(actual.is_contiguous())
+        np.testing.assert_allclose(actual.numpy(), expected.numpy(), atol=1e-6)
+
+    def test_rolling_performance_uses_a_bounded_window(self):
+        metrics = RollingPerformance(window_size=2)
+        metrics.add(10, 100, 5, 200)
+        metrics.add(20, 200, 10, 400)
+        metrics.add(30, 300, 15, 600)
+
+        snapshot = metrics.snapshot()
+
+        self.assertEqual(snapshot["frames"], 2)
+        self.assertEqual(snapshot["inference_ms"], 250)
+        self.assertEqual(snapshot["inference_fps"], 4)
+        self.assertEqual(snapshot["processing_fps"], 2)
+
+    def test_process_resource_monitor_reports_cpu_and_memory(self):
+        resources = ProcessResourceMonitor().sample()
+
+        self.assertGreaterEqual(resources["cpu_percent"], 0)
+        self.assertGreater(resources["memory_mb"], 0)
+        self.assertGreaterEqual(
+            resources["peak_memory_mb"],
+            resources["memory_mb"],
+        )
+
+    def test_default_threads_preserve_torch_default_and_video_skip_is_allowed(self):
+        args = parse_args(["--device", "cpu", "--frame-skip", "2"])
+
+        self.assertEqual(args.threads, 0)
+        self.assertEqual(args.frame_skip, 2)
+
+    def test_example_configs_use_unthrottled_default_thread_selection(self):
+        for config_name in ("video.example.json", "rtsp.example.json"):
+            with self.subTest(config=config_name):
+                args = parse_args(["--config", "configs/" + config_name])
+                self.assertEqual(args.threads, 0)
+                self.assertFalse(args.channels_last)
+
     def test_device_auto_uses_cuda_only_when_available(self):
         with mock.patch("predict_video.torch.cuda.is_available", return_value=False):
             self.assertEqual(str(resolve_device("auto")), "cpu")

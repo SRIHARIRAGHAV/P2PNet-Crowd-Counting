@@ -41,10 +41,10 @@ P2PNet/
   dataset/                 Dataset placement notes and retained manifests
   docs/                    Licensing and publication checklist
   evaluation/              Count evaluation and reports
-  inference/               Shared device selection and image inference
+  inference/               Device selection, image inference, and metrics
   original_repo/            Upstream P2PNet model, training and license
   preprocessing/            Dataset validation and list-generation scripts
-  scripts/                 CPU setup scripts for Windows and Linux
+  scripts/                 CPU setup and reproducible benchmark scripts
   tests/                   RTSP/display/configuration unit tests
   predict_video.py          Prerecorded video and RTSP inference
   requirements*.txt         Common, CPU, and CUDA dependency setup
@@ -82,6 +82,20 @@ From the project directory in PowerShell:
 ```
 
 The last command should report a CPU PyTorch build and `False` for CUDA.
+Video and image inference default to PyTorch's configured intra-op thread count
+(`--threads 0`) and one inter-op thread. No FPS cap is applied. Benchmark 1, 2,
+and 4 intra-op threads on the target machine rather than assuming that
+hyperthreading makes four threads faster.
+For an explicit OpenMP/MKL environment trial, set these before launching
+Python, and use the same value for `--threads`:
+
+```powershell
+$env:OMP_NUM_THREADS = "2"
+$env:MKL_NUM_THREADS = "2"
+```
+
+CPU affinity is not forced: pinning a worker to one of the two physical cores
+or its hyperthread can reduce throughput, so the OS scheduler is left free.
 
 ### CPU setup on Linux
 
@@ -95,6 +109,26 @@ bash scripts/setup_cpu_linux.sh
 ```
 
 ### NVIDIA CUDA setup
+
+On Ubuntu with Python 3.10 and an NVIDIA RTX 5060, first verify the driver:
+
+```bash
+nvidia-smi
+python3.10 --version
+sudo apt update
+sudo apt install -y python3.10 python3.10-venv ffmpeg
+```
+
+Create a CUDA environment and install a PyTorch build that supports the
+installed driver. CUDA 12.8 is the recommended starting point for RTX 5060
+class Blackwell GPUs; verify the selected wheel on the target machine rather
+than assuming its CUDA runtime equals the driver's toolkit package:
+
+```bash
+bash scripts/setup_gpu_linux.sh cu128
+.venv-gpu/bin/python -m pip check
+.venv-gpu/bin/python -c "import torch, torchvision, cv2; print('torch', torch.__version__, 'torchvision', torchvision.__version__, 'opencv', cv2.__version__); print('CUDA available:', torch.cuda.is_available(), 'PyTorch CUDA:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'none')"
+```
 
 Install a current NVIDIA driver, then use the official
 [PyTorch installation selector](https://pytorch.org/get-started/locally/) to
@@ -143,8 +177,11 @@ avoid loading the entire dataset into memory. For example:
   --frames-dir "C:\data\crowd_images" `
   --weight .\original_repo\weights\SHTechA.pth `
   --device cpu `
-  --threads 1
+  --threads 0
 ```
+
+`--threads 0` preserves PyTorch's default intra-op setting. Pass a positive
+value to select an explicit benchmarked setting.
 
 The script writes predicted counts, inference time, and head-point coordinates
 to `outputs/predictions/crowd_point_annotations_predictions.csv`, and annotated
@@ -177,22 +214,32 @@ the inference device:
   --input "C:\data\park_video.mp4" `
   --checkpoint .\original_repo\weights\SHTechA.pth `
   --device cpu `
-  --output .\outputs\park_video\park_crowd_count_output.mp4 `
-  --max-frames 2
+  --threads 0 `
+  --output .\outputs\park_video\park_crowd_count_output.mp4
 ```
 
-Remove `--max-frames 2` to process the complete video. Omit `--device` for
-automatic selection or use `--device cuda` on a verified CUDA environment.
+This processes the complete video without an FPS cap. Use `--max-frames 2` only
+for a short smoke test. Omit `--device` for automatic selection or use
+`--device cuda` on a verified CUDA environment.
 `--threshold` controls the foreground point-confidence threshold, and
 `--max-long-edge` controls inference resolution while points are mapped back
 to the source frame.
+`--frame-skip N` runs inference once per N decoded frames while retaining every
+source frame in the output video; skipped frames are written without stale
+point overlays. This can increase effective stream coverage, but it does not
+increase the model's per-frame inference speed. `--channels-last` is an
+experimental CPU option and should only be used if the benchmark shows a
+throughput gain and an acceptable count difference.
 
 The output MP4 retains source dimensions and frame rate. A sibling
-`park_frame_counts.csv` records per-frame counts and timings; a sibling
-`park_video_summary.json` records aggregate metrics. Inference time measures
-the model forward pass; total processing time includes decoding, preprocessing,
-postprocessing, drawing, and video writing. Existing output paths are
-protected: select a new output path or explicitly pass `--overwrite`.
+`park_frame_counts.csv` records counts, preprocessing/inference/postprocessing
+latency, rolling inference and end-to-end processing FPS, CPU utilization, and
+resident memory. `park_video_summary.json` includes run-wide averages and peak
+memory. The live RTSP overlay reports rolling metrics over the latest 30
+inferred frames. Inference FPS measures model forwards per second; processing
+FPS includes preprocessing, inference, postprocessing, overlays, and recording
+writes, but excludes model initialization. Existing output paths are protected:
+select a new output path or explicitly pass `--overwrite`.
 
 ## Live RTSP inference
 
@@ -215,7 +262,25 @@ Start monitoring; press `q` in the display window or `Ctrl+C` to stop:
 .\.venv-cpu\Scripts\python.exe .\predict_video.py `
   --mode rtsp `
   --source-env P2PNET_RTSP_URL `
-  --device cpu
+  --device cpu `
+  --threads 0
+```
+
+On Ubuntu with the GPU environment:
+
+```bash
+export P2PNET_RTSP_URL='rtsp://USERNAME:PASSWORD@CAMERA_IP:554/live/2/1/avm'
+export OPENCV_FFMPEG_CAPTURE_OPTIONS='rtsp_transport;tcp|fflags;nobuffer|flags;low_delay'
+
+.venv-gpu/bin/python predict_video.py \
+  --mode rtsp \
+  --source "$P2PNET_RTSP_URL" \
+  --device cuda:0 \
+  --checkpoint ./original_repo/weights/SHTechA.pth \
+  --frame-skip 1 \
+  --reconnect-interval 3 \
+  --open-timeout-ms 5000 \
+  --read-timeout-ms 3000
 ```
 
 For optional annotated recording or a five-minute bounded run:
@@ -236,12 +301,13 @@ The default RTSP outputs are:
 - `outputs/rtsp/rtsp_video_summary.json`.
 
 Recording preserves the incoming frame resolution; display resizing does not
-change the saved video. The CSV separates inference time from total processing
-time and records count, points, FPS, timestamp, and camera status. The JSON
-summary includes processed frames, count statistics, timing averages, total
-monitoring duration, and reconnect attempts. It does not contain the source
-URL. Existing results are preserved; when default results already exist, a
-timestamped set of output names is selected automatically.
+change the saved video. The CSV separates preprocessing, inference,
+postprocessing, and total processing time and records rolling inference/
+processing FPS, CPU utilization, memory, count, timestamp, and camera status.
+The JSON summary includes processed frames, count statistics, timing averages,
+CPU/memory, total monitoring duration, and reconnect attempts. It does not
+contain the source URL. Existing results are preserved; when default results
+already exist, a timestamped set of output names is selected automatically.
 
 The reader uses OpenCV's FFmpeg backend, bounded open/read timeouts, TCP
 transport, a one-frame capture buffer where available, and a latest-frame
@@ -253,6 +319,8 @@ Useful options:
 | `--duration` | `0` | Monitoring duration in seconds; zero means until stopped |
 | `--frame-skip` | `1` | Process every Nth received frame |
 | `--max-long-edge` | `1024` | Maximum inference image edge, not recording size |
+| `--threads` | `0` | PyTorch intra-op threads; zero preserves PyTorch's default |
+| `--channels-last` | off | Experimental CPU memory format; benchmark first |
 | `--reconnect-interval` | `3` | Delay between connection attempts, seconds |
 | `--max-reconnect-attempts` | `10` | Finite reconnect limit |
 | `--open-timeout-ms` / `--read-timeout-ms` | `5000` / `3000` | FFmpeg connection/read timeouts |
@@ -309,7 +377,54 @@ Run the focused automated suite from the project root:
 The tests cover device selection behavior, checkpoint-independent point
 filtering, URL/config validation, simulated latest-frame and reconnect
 behavior, output-name collision handling, and display aspect-ratio/point
-mapping. They do not prove access to a real camera or CUDA availability.
+mapping. They also verify preprocessing parity, rolling metrics, and local
+process CPU/memory reporting. They do not prove access to a real camera or
+CUDA availability.
+
+## Reproducible CPU benchmark
+
+The benchmark decodes or loads a fixed set of frames once, then reuses those
+same frames and the same strict-loaded checkpoint for every configuration. It
+warms up each PyTorch configuration, compares the original preprocessing with
+the allocation-reduced preprocessing, sweeps thread counts, and tests
+channels-last layout. The report separates inference latency/FPS from
+frame-to-count processing latency/FPS, and includes CPU utilization, memory,
+per-frame count differences, and optional MAE/RMSE against ground truth.
+Results are saved as JSON and CSV under the selected output directory.
+
+On the i3-1115G4 target (four logical processors), run:
+
+```powershell
+.\.venv-cpu\Scripts\python.exe .\scripts\benchmark_cpu.py `
+  --input .\dataset\video\park_video.mp4 `
+  --checkpoint .\original_repo\weights\SHTechA.pth `
+  --threads 1,2,4 `
+  --warmup 3 `
+  --max-frames 60 `
+  --output-dir .\outputs\cpu_benchmark
+```
+
+For image folders, `--frames-dir` can replace `--input`. Adjacent same-stem
+`.txt` point annotations are counted automatically. Otherwise provide a CSV
+with `frame_id,count` columns (video frame IDs are one-based; image frame IDs
+are paths relative to `--frames-dir`) using
+`--ground-truth-csv .\ground_truth_counts.csv`. Without annotations, MAE/RMSE
+are unavailable;
+count differences are still compared against the original PyTorch output.
+
+ONNX Runtime CPU and OpenVINO CPU are attempted only when their dependencies
+are installed; unavailable or incompatible exports are recorded as such.
+Optional installs are `python -m pip install onnx onnxruntime` or
+`python -m pip install openvino`. Dynamic INT8 quantization is reported as not
+applicable when the model has no dynamically quantizable linear layers (the
+current P2PNet inference graph is convolution-based). The script does not
+silently quantize the model or alter its resolution/checkpoint.
+
+Choose the fastest measured configuration whose maximum count difference
+matches your accuracy requirement, then pass its thread count to
+`predict_video.py`. Results depend on the exact CPU, PyTorch build, OpenCV
+backend, input resolution, and power/thermal state. Do not copy FPS numbers
+from a different system as target-hardware results.
 
 For a one/two-frame end-to-end video smoke test, use a local test video and
 checkpoint:
